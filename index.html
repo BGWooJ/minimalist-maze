@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Minimalist Maze: Glow & Physics</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  https://unpkg.com
+  styles.css
+</head>
+<body>
+  <div id="hud">
+    <div class="left">
+      <span id="levelLabel">Level 1</span>
+      <span id="shapeLabel">◻︎</span>
+      <span id="timerLabel">00:00.0</span>
+    </div>
+    <div class="right">
+      <button id="btnPrev">Levels</button>
+      <button id="btnRestart">Restart</button>
+      <button id="btnNext">Next</button>
+      <button id="btnSettings">⚙︎</button>
+    </div>
+  </div>
+
+  <canvas id="game" width="1280" height="720"></canvas>
+
+  <!-- Micro tutorial -->
+  <div id="tutorial" class="card">
+    <div class="title">Drag to guide. Release to bounce.</div>
+    <button id="dismissTutorial">Got it</button>
+  </div>
+
+  <!-- Settings -->
+  <div id="settingsPanel" class="panel">
+    <h3>Settings</h3>
+    <label><input type="checkbox" id="highContrast" /> High contrast mode</label>
+    <label><input type="checkbox" id="thickWalls" /> Thicker walls</label>
+    <label><input type="checkbox" id="hapticsToggle" /> Haptics</label>
+    <label>Sound volume <input type="range" id="volumeSlider" min="0" max="1" step="0.05" value="0.6" /></label>
+    <button id="closeSettings">Close</button>
+  </div>
+
+  <!-- Analytics -->
+  <div id="analyticsPanel" class="panel">
+    <h3>Analytics</h3>
+    <div id="analyticsContent"></div>
+    <button id="closeAnalytics">Close</button>
+  </div>
+
+  <!-- Matter.js from CDN -->
+  https://unpkg.com/matter-js@0.19.0/build/matter.min.js</script>
+  <!-- Game code -->
+  <rc/main.js</script>
+</body>
+</html>
