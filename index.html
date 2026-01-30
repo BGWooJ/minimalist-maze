@@ -1,22 +1,23 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-<meta charset="UTF-8" />
+<meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>Minimalist Maze: Glow & Physics</title>
 <style>
   :root {
     --bg: #0E0F12;
-    --wall: #1A1A1A;
-    --ball: #2FD0FF;
-    --spark: #FF7A00;
+    --wall-dark: #1A1A1A;
+    --wall-glow: #7B2FFF;   /* purple glow */
+    --ball: #2FD0FF;        /* blue glow */
+    --goal: #FF7A00;        /* orange spark */
   }
-  body { margin: 0; background: var(--bg); color: #fff; font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; }
-  #hud { position: fixed; top: 10px; left: 10px; display: flex; gap: 8px; z-index: 10; }
+  body { margin:0; background:var(--bg); color:#fff; font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif; }
+  #hud { position:fixed; top:10px; left:10px; display:flex; gap:8px; z-index:10; }
   .btn { background:#1A1A1A; color:#fff; border:none; padding:6px 10px; border-radius:6px; cursor:pointer; }
   .btn:hover { background:#242424; }
-  #tooltip { position: fixed; bottom: 12px; left: 12px; opacity: 0.8; font-size: 13px; }
-  canvas { display:block; width:100vw; height:100vh; touch-action: none; } /* critical for mobile pointer events */
+  #tooltip { position:fixed; bottom:12px; left:12px; opacity:0.8; font-size:13px; }
+  canvas { display:block; width:100vw; height:100vh; touch-action:none; } /* critical for touch drag */
 </style>
 </head>
 <body>
@@ -26,3 +27,435 @@
     <button class="btn" id="btnRestart">Restart</button>
   </div>
   <div id="tooltip">Drag to guide. Release to bounce.</div>
+  <canvas id="canvas"></canvas>
+
+<script>
+(() => {
+  // --- Canvas + DPR ---
+  const canvas = document.getElementById('canvas');
+  const ctx = canvas.getContext('2d', { alpha: false });
+  const dpr = Math.max(1, window.devicePixelRatio || 1);
+  function resize() {
+    canvas.width = Math.floor(window.innerWidth * dpr);
+    canvas.height = Math.floor(window.innerHeight * dpr);
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0); // draw in CSS pixels
+  }
+  window.addEventListener('resize', resize);
+  resize();
+
+  // --- Game state ---
+  let level = 1;
+  let seed = Math.floor(Math.random() * 1e9);
+
+  const cellSize = 42;  // CSS px per cell (tweak for maze density)
+  const cols = 21, rows = 21; // "complex" maze size
+  const margin = 64;
+
+  const ball = { x:0, y:0, r:14, vx:0, vy:0 };
+  const goal = { x:0, y:0, r:18 };
+
+  let maze = null;           // 2D array of cells with walls {N,S,E,W}
+  let startCell = null;      // {x,y}
+  let goalCell = null;       // {x,y} farthest from start
+  let dragging = false;
+  let lastDrag = { x:0, y:0, t:0 };
+  let particles = [];
+  let pulses = [];           // wall collision glow pulses
+
+  // physics tuning
+  const restitution = 0.55;    // bounce
+  const damping = 0.99;        // release velocity decay
+  const maxReleaseSpeed = 620; // cap flick speed
+  const minDt = 1/120, maxDt = 1/20;
+
+  // colors
+  const WALL_DARK = getCSS('--wall-dark', '#1A1A1A');
+  const WALL_GLOW = getCSS('--wall-glow', '#7B2FFF');
+  const BALL_COLOR = getCSS('--ball', '#2FD0FF');
+  const GOAL_COLOR = getCSS('--goal', '#FF7A00');
+
+  function getCSS(varName, fallback) {
+    return getComputedStyle(document.documentElement).getPropertyValue(varName) || fallback;
+  }
+
+  // --- RNG ---
+  function mulberry32(a){return function(){a|=0;a=a+0x6D2B79F5|0;var t=Math.imul(a^a>>>15,1|a);t^=t+Math.imul(t^t>>>7,61|t);return((t^t>>>14)>>>0)/4294967296;}}
+  function randi(rng,min,max){ return Math.floor(rng()*(max-min+1))+min; }
+
+  // --- Maze generation (Recursive Backtracker + farthest goal via BFS) ---
+  function generateMaze(seed) {
+    const rng = mulberry32(seed);
+
+    // grid init
+    const grid = Array.from({ length: rows }, (_, y) =>
+      Array.from({ length: cols }, (_, x) => ({
+        x, y,
+        walls: { N: true, S: true, E: true, W: true }
+      }))
+    );
+
+    // start on random perimeter (left/right/top/bottom)
+    const sides = ['L','R','T','B'];
+    const side = sides[randi(rng,0,3)];
+    const start = {
+      x: side === 'L' ? 0 : side === 'R' ? cols - 1 : randi(rng, 0, cols - 1),
+      y: side === 'T' ? 0 : side === 'B' ? rows - 1 : randi(rng, 0, rows - 1)
+    };
+
+    // carve using recursive backtracker
+    const stack = [];
+    let current = grid[start.y][start.x];
+    const visited = new Set([`${current.x},${current.y}`]);
+
+    function neighbors(c){
+      const dirs=[['N',0,-1,'S'],['S',0,1,'N'],['E',1,0,'W'],['W',-1,0,'E']];
+      const ns=[];
+      for(const [d,dx,dy,opp] of dirs){
+        const nx=c.x+dx, ny=c.y+dy;
+        if(nx>=0 && nx<cols && ny>=0 && ny<rows && !visited.has(`${nx},${ny}`))
+          ns.push({ dir:d, opp, cell:grid[ny][nx] });
+      }
+      return ns;
+    }
+
+    while(true){
+      const ns = neighbors(current);
+      if (ns.length) {
+        stack.push(current);
+        const pick = ns[Math.floor(rng() * ns.length)];
+        current.walls[pick.dir] = false;
+        pick.cell.walls[pick.opp] = false;
+        current = pick.cell;
+        visited.add(`${current.x},${current.y}`);
+      } else if (stack.length) current = stack.pop();
+      else break;
+    }
+
+    // inject 1–2 small loops for variety
+    const loops = randi(rng, 1, 2);
+    for (let i = 0; i < loops; i++) {
+      const x = randi(rng, 1, cols - 2);
+      const y = randi(rng, 1, rows - 2);
+      const dirs=[['N',0,-1,'S'],['S',0,1,'N'],['E',1,0,'W'],['W',-1,0,'E']];
+      const d = dirs[randi(rng, 0, 3)];
+      const a = grid[y][x], b = grid[y + d[2]][x + d[1]];
+      a.walls[d[0]] = false; b.walls[d[3]] = false;
+    }
+
+    // find farthest reachable cell from start (end of maze)
+    const far = farthestCell(grid, start);
+    return { grid, start, goal: far };
+  }
+
+  // BFS to farthest cell
+  function farthestCell(grid, start) {
+    const q = [{ x:start.x, y:start.y, d:0 }];
+    const seen = new Set([`${start.x},${start.y}`]);
+    let far = { x:start.x, y:start.y, d:0 };
+
+    while (q.length) {
+      const cur = q.shift();
+      if (cur.d > far.d) far = { x: cur.x, y: cur.y, d: cur.d };
+      const c = grid[cur.y][cur.x];
+      const moves = [];
+      if (!c.walls.N) moves.push({ x: cur.x, y: cur.y - 1 });
+      if (!c.walls.S) moves.push({ x: cur.x, y: cur.y + 1 });
+      if (!c.walls.E) moves.push({ x: cur.x + 1, y: cur.y });
+      if (!c.walls.W) moves.push({ x: cur.x - 1, y: cur.y });
+      for (const m of moves) {
+        const k = `${m.x},${m.y}`;
+        if (!seen.has(k)) { seen.add(k); q.push({ x: m.x, y: m.y, d: cur.d + 1 }); }
+      }
+    }
+    return { x: far.x, y: far.y };
+  }
+
+  // --- Setup level ---
+  function setupLevel() {
+    const gen = generateMaze(seed);
+    maze = gen.grid;
+    startCell = gen.start;
+    goalCell = gen.goal;
+
+    ball.x = margin + startCell.x * cellSize + cellSize * 0.5;
+    ball.y = margin + startCell.y * cellSize + cellSize * 0.5;
+    ball.vx = 0; ball.vy = 0;
+
+    goal.x = margin + goalCell.x * cellSize + cellSize * 0.5;
+    goal.y = margin + goalCell.y * cellSize + cellSize * 0.5;
+
+    particles.length = 0;
+    pulses.length = 0;
+
+    document.getElementById('levelLabel').textContent = `Level ${level} (seed ${seed})`;
+  }
+
+  // --- Input: direct drag + release velocity ---
+  function pointerPos(e) {
+    const rect = canvas.getBoundingClientRect();
+    return { x: e.clientX - rect.left, y: e.clientY - rect.top };
+  }
+
+  canvas.addEventListener('pointerdown', e => {
+    e.preventDefault();
+    const p = pointerPos(e);
+    dragging = true;
+    lastDrag = { x: p.x, y: p.y, t: performance.now() };
+    // snap ball to pointer immediately
+    ball.x = p.x; ball.y = p.y;
+    try { canvas.setPointerCapture(e.pointerId); } catch {}
+  }, { passive: false });
+
+  canvas.addEventListener('pointermove', e => {
+    if (!dragging) return;
+    e.preventDefault();
+    const p = pointerPos(e);
+    const now = performance.now();
+    const dt = Math.max(minDt, Math.min(maxDt, (now - lastDrag.t) / 1000));
+
+    // release-like velocity from pointer motion
+    const vx = (p.x - lastDrag.x) / dt;
+    const vy = (p.y - lastDrag.y) / dt;
+    const sp = Math.hypot(vx, vy);
+    const cap = Math.min(1, maxReleaseSpeed / Math.max(sp, 1));
+    ball.vx = vx * cap;
+    ball.vy = vy * cap;
+
+    // follow pointer
+    ball.x = p.x; ball.y = p.y;
+
+    // resolve local collisions while dragging
+    collideNearWalls(true);
+
+    lastDrag = { x: p.x, y: p.y, t: now };
+  }, { passive: false });
+
+  canvas.addEventListener('pointerup', e => {
+    e.preventDefault();
+    dragging = false;
+    try { canvas.releasePointerCapture(e.pointerId); } catch {}
+  }, { passive: false });
+
+  canvas.addEventListener('pointerleave', () => { dragging = false; });
+
+  // --- Particles ---
+  function spawnParticles(x, y, count = 115) {
+    for (let i = 0; i < count; i++) {
+      const a = Math.random() * Math.PI * 2;
+      const s = 230 + Math.random() * 160;
+      particles.push({ x, y, vx: Math.cos(a) * s, vy: Math.sin(a) * s, life: 0.42, max: 0.42, color: GOAL_COLOR });
+    }
+  }
+
+  // --- Register a pulse on a wall segment ---
+  function addPulse(x1,y1,x2,y2,intensity,color=BALL_COLOR) {
+    pulses.push({ x1,y1,x2,y2, life: 0.15, max: 0.15, alpha: Math.min(0.8, Math.max(0.15, intensity)), color });
+  }
+
+  // --- Collisions (check current cell + neighbors) ---
+  function collideNearWalls(fromDrag=false) {
+    const cx = Math.floor((ball.x - margin) / cellSize);
+    const cy = Math.floor((ball.y - margin) / cellSize);
+
+    for (let iy = cy - 1; iy <= cy + 1; iy++) {
+      for (let ix = cx - 1; ix <= cx + 1; ix++) {
+        if (ix < 0 || ix >= cols || iy < 0 || iy >= rows) continue;
+        const c = maze[iy][ix];
+        const bx = margin + ix * cellSize;
+        const by = margin + iy * cellSize;
+        const left = bx, right = bx + cellSize, top = by, bottom = by + cellSize;
+
+        // North
+        if (c.walls.N && ball.y - ball.r < top && ball.x > left && ball.x < right) {
+          const impact = Math.abs(ball.vy);
+          ball.y = top + ball.r;
+          ball.vy = -Math.abs(ball.vy) * restitution;
+          addPulse(bx, by, bx + cellSize, by, impact / maxReleaseSpeed);
+        }
+        // South
+        if (c.walls.S && ball.y + ball.r > bottom && ball.x > left && ball.x < right) {
+          const impact = Math.abs(ball.vy);
+          ball.y = bottom - ball.r;
+          ball.vy = -Math.abs(ball.vy) * restitution;
+          addPulse(bx, by + cellSize, bx + cellSize, by + cellSize, impact / maxReleaseSpeed);
+        }
+        // West
+        if (c.walls.W && ball.x - ball.r < left && ball.y > top && ball.y < bottom) {
+          const impact = Math.abs(ball.vx);
+          ball.x = left + ball.r;
+          ball.vx = -Math.abs(ball.vx) * restitution;
+          addPulse(bx, by, bx, by + cellSize, impact / maxReleaseSpeed);
+        }
+        // East
+        if (c.walls.E && ball.x + ball.r > right && ball.y > top && ball.y < bottom) {
+          const impact = Math.abs(ball.vx);
+          ball.x = right - ball.r;
+          ball.vx = -Math.abs(ball.vx) * restitution;
+          addPulse(bx + cellSize, by, bx + cellSize, by + cellSize, impact / maxReleaseSpeed);
+        }
+      }
+    }
+  }
+
+  // --- Update ---
+  function update(dt) {
+    dt = Math.min(Math.max(dt, minDt), maxDt);
+
+    if (!dragging) {
+      ball.x += ball.vx * dt;
+      ball.y += ball.vy * dt;
+      ball.vx *= damping;
+      ball.vy *= damping;
+      collideNearWalls(false);
+    }
+
+    // goal check (glowing orange black hole at farthest cell)
+    const dx = ball.x - goal.x, dy = ball.y - goal.y;
+    if (Math.hypot(dx, dy) < goal.r) {
+      spawnParticles(ball.x, ball.y);
+      setTimeout(() => { level++; seed = Math.floor(Math.random() * 1e9); setupLevel(); }, 500);
+    }
+
+    // particles
+    particles = particles.filter(p => {
+      p.life -= dt;
+      p.x += p.vx * dt; p.y += p.vy * dt;
+      return p.life > 0;
+    });
+
+    // pulses decay
+    pulses = pulses.filter(pl => {
+      pl.life -= dt;
+      return pl.life > 0;
+    });
+  }
+
+  // --- Draw ---
+  function draw() {
+    // bg
+    ctx.fillStyle = '#0E0F12';
+    ctx.fillRect(0,0,canvas.width/dpr,canvas.height/dpr);
+
+    // walls: purple glow base (draw glow first, then dark strokes)
+    ctx.save();
+    ctx.globalCompositeOperation = 'lighter';
+    ctx.strokeStyle = WALL_GLOW;
+    ctx.globalAlpha = 0.35;
+    ctx.lineWidth = 6;           // thicker glow stroke
+    for (let y=0; y<rows; y++) {
+      for (let x=0; x<cols; x++) {
+        const c = maze[y][x];
+        const bx = margin + x * cellSize;
+        const by = margin + y * cellSize;
+        ctx.beginPath();
+        if (c.walls.N){ ctx.moveTo(bx, by); ctx.lineTo(bx + cellSize, by); }
+        if (c.walls.S){ ctx.moveTo(bx, by + cellSize); ctx.lineTo(bx + cellSize, by + cellSize); }
+        if (c.walls.W){ ctx.moveTo(bx, by); ctx.lineTo(bx, by + cellSize); }
+        if (c.walls.E){ ctx.moveTo(bx + cellSize, by); ctx.lineTo(bx + cellSize, by + cellSize); }
+        ctx.stroke();
+      }
+    }
+    ctx.restore();
+
+    // walls: dark lines on top for crisp geometry
+    ctx.strokeStyle = WALL_DARK;
+    ctx.lineWidth = 4;
+    for (let y=0; y<rows; y++) {
+      for (let x=0; x<cols; x++) {
+        const c = maze[y][x];
+        const bx = margin + x * cellSize;
+        const by = margin + y * cellSize;
+        ctx.beginPath();
+        if (c.walls.N){ ctx.moveTo(bx, by); ctx.lineTo(bx + cellSize, by); }
+        if (c.walls.S){ ctx.moveTo(bx, by + cellSize); ctx.lineTo(bx + cellSize, by + cellSize); }
+        if (c.walls.W){ ctx.moveTo(bx, by); ctx.lineTo(bx, by + cellSize); }
+        if (c.walls.E){ ctx.moveTo(bx + cellSize, by); ctx.lineTo(bx + cellSize, by + cellSize); }
+        ctx.stroke();
+      }
+    }
+
+    // pulses on walls (take on ball glow)
+    ctx.save();
+    ctx.globalCompositeOperation = 'lighter';
+    for (const pl of pulses) {
+      const alpha = (pl.life / pl.max) * pl.alpha;
+      ctx.globalAlpha = alpha;
+      ctx.strokeStyle = pl.color;
+      ctx.lineWidth = 8;
+      ctx.beginPath();
+      ctx.moveTo(pl.x1, pl.y1);
+      ctx.lineTo(pl.x2, pl.y2);
+      ctx.stroke();
+
+      // slight blur effect for softer pulse
+      // Note: blur filter may be heavy; kept subtle for performance
+      // ctx.filter = 'blur(1px)'; // uncomment if you want a softer pulse
+    }
+    ctx.restore();
+    ctx.globalAlpha = 1;
+
+    // goal: orange glow + inner black sink (at farthest cell)
+    ctx.save();
+    ctx.globalCompositeOperation = 'lighter';
+    const ggrad = ctx.createRadialGradient(goal.x, goal.y, goal.r * 0.7, goal.x, goal.y, goal.r * 2.2);
+    ggrad.addColorStop(0, 'rgba(255,122,0,0.85)');
+    ggrad.addColorStop(1, 'rgba(255,122,0,0)');
+    ctx.fillStyle = ggrad;
+    ctx.beginPath(); ctx.arc(goal.x, goal.y, goal.r * 2.2, 0, Math.PI * 2); ctx.fill();
+    ctx.restore();
+
+    ctx.beginPath();
+    ctx.arc(goal.x, goal.y, goal.r, 0, Math.PI * 2);
+    ctx.fillStyle = '#000000'; ctx.fill();
+    ctx.lineWidth = 2; ctx.strokeStyle = GOAL_COLOR; ctx.stroke();
+
+    // ball glow
+    ctx.save();
+    ctx.globalCompositeOperation = 'lighter';
+    const grad = ctx.createRadialGradient(ball.x, ball.y, ball.r * 0.6, ball.x, ball.y, ball.r * 2.1);
+    grad.addColorStop(0, BALL_COLOR);
+    grad.addColorStop(1, 'rgba(47,208,255,0)');
+    ctx.fillStyle = grad;
+    ctx.beginPath(); ctx.arc(ball.x, ball.y, ball.r * 2.1, 0, Math.PI * 2); ctx.fill();
+    ctx.restore();
+
+    // ball core
+    ctx.fillStyle = BALL_COLOR;
+    ctx.beginPath(); ctx.arc(ball.x, ball.y, ball.r, 0, Math.PI * 2); ctx.fill();
+
+    // particles
+    ctx.save();
+    ctx.globalCompositeOperation = 'lighter';
+    for (const p of particles) {
+      const alpha = Math.max(0, (p.life / p.max) * 1.4);
+      ctx.globalAlpha = alpha;
+      ctx.fillStyle = p.color;
+      ctx.beginPath(); ctx.arc(p.x, p.y, 3, 0, Math.PI * 2); ctx.fill();
+    }
+    ctx.restore();
+    ctx.globalAlpha = 1;
+  }
+
+  // --- Loop ---
+  let last = performance.now();
+  function loop(now) {
+    const dt = (now - last) / 1000;
+    last = now;
+    update(dt);
+    draw();
+    requestAnimationFrame(loop);
+  }
+
+  // --- HUD ---
+  document.getElementById('btnNext').onclick = () => {
+    level++; seed = Math.floor(Math.random() * 1e9); setupLevel();
+  };
+  document.getElementById('btnRestart').onclick = () => setupLevel();
+
+  // init
+  setupLevel();
+  requestAnimationFrame(loop);
+})();
+</script>
+</body>
+</html>
